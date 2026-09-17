@@ -8,6 +8,7 @@ import os
 import glob
 import math
 import numpy as np
+import torch
 
 def make_intrinsic(fx, fy, mx, my):
     '''Create camera intrinsics.'''
@@ -41,6 +42,61 @@ class PointCloudToImageMapper(object):
         self.image_dim = image_dim
         self.vis_thres = visibility_threshold
         self.cut_bound = cut_bound
+
+    def compute_multi_masked_mapping(
+        self, camera_to_world, coords, mask_list, depth, intrinsic, device
+    ):
+        """
+        Same thing as masked mapping, but batches a list of N masks for better efficiency!
+
+        :param camera_to_world: 4 x 4
+        :param coords: N x 3 format
+        :param depth: H x W format
+        :param intrinsic: 3x3 format
+        :return: mapping, N x 3 format, (H,W,mask)
+        """
+        depth = torch.tensor(depth).to(device)
+        mask_list = torch.tensor(mask_list).to(device)
+        intrinsic = torch.tensor(intrinsic).to(device)
+        camera_to_world = torch.tensor(camera_to_world).to(device)
+        mapping = torch.zeros(
+            (mask_list.shape[0], 3, coords.shape[0]), dtype=torch.int
+        ).to(device)
+        coords_new = torch.cat(
+            [coords, torch.ones([coords.shape[0], 1]).to(device)], dim=1
+        ).transpose(1, 0)
+        assert coords_new.shape[0] == 4, "[!] Shape error"
+
+        world_to_camera = torch.linalg.inv(camera_to_world)
+        p = torch.matmul(world_to_camera, coords_new)
+        p[0] = (p[0] * intrinsic[0][0]) / p[2] + intrinsic[0][2]
+        p[1] = (p[1] * intrinsic[1][1]) / p[2] + intrinsic[1][2]
+        pi = torch.round(p).to(torch.int)  # simply round the projected coordinates
+        inside_mask = (
+            (pi[0] >= self.cut_bound)
+            * (pi[1] >= self.cut_bound)
+            * (pi[0] < self.image_dim[0] - self.cut_bound)
+            * (pi[1] < self.image_dim[1] - self.cut_bound)
+        )
+
+        for i, mask in enumerate(mask_list):
+            _depth = depth.clone()
+            _depth = torch.where(mask <= 0, 0, _depth)
+            depth_cur = _depth[pi[1][inside_mask], pi[0][inside_mask]]
+            occlusion_mask = (
+                torch.abs(
+                    depth[pi[1][inside_mask], pi[0][inside_mask]] - p[2][inside_mask]
+                )
+                <= self.vis_thres * depth_cur
+            )
+            inside_mask_i = inside_mask.clone()
+            inside_mask_i[inside_mask == True] = occlusion_mask
+
+            mapping[i][0][inside_mask_i] = pi[1][inside_mask_i]
+            mapping[i][1][inside_mask_i] = pi[0][inside_mask_i]
+            mapping[i][2][inside_mask_i] = 1
+
+        return mapping.transpose(2, 1).cpu().numpy()
 
     def compute_mapping(self, camera_to_world, coords, depth=None, intrinsic=None):
         """
